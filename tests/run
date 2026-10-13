@@ -4,6 +4,7 @@
 # Needs qmltestrunner (qt6-declarative); no display is required.
 set -euo pipefail
 tests=$(cd "$(dirname "$0")" && pwd)
+python3 "$tests/test_cli.py"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 

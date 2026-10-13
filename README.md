@@ -47,7 +47,9 @@ clicking a row copies it.
 - **Script applets** are executables in any language that print JSON. Items
   can run actions, copy text or open URLs. Applets can take text input, refresh
   on an interval, or stream updates line by line. The output also works as a
-  Waybar custom module.
+  Waybar custom module. Non-streaming refreshes and action/input runs are
+  serialized: actions queue in order, refresh requests are combined, and
+  each run has its own timeout.
 - **QML applets** are full Quickshell QML. They get an `applet` object (config,
   store, notify, run…) and themed components from `import qs.Applets`. A QML
   file can also be a custom bar item, such as a media player.
@@ -58,7 +60,9 @@ clicking a row copies it.
   window, or a `desktop` widget under (or above) your windows.
 - **Theme**: pass your theme object (`theme: Theme`) and applets follow it,
   including live theme switches.
-- **Live reload**: saving any file in an applet folder reloads that applet.
+- **Live reload**: file changes and deletions reload the applet, including
+  updates that preserve modification times. Hidden directories and Python
+  cache directories are ignored.
   QML errors show inside the applet instead of breaking the shell.
 
 [SPEC.md](SPEC.md) is the full format: manifest keys, script protocol, QML API,
@@ -67,20 +71,26 @@ bar, theme tokens, embedding and IPC.
 ## Requirements
 
 - [Quickshell](https://quickshell.org) 0.3 or later and Python 3.11 or later.
+- Linux with `renameat2` support in the system C library, kernel and target
+  filesystem for atomic applet installation.
 - A Wayland compositor with layer-shell (Hyprland, Sway, niri, river…).
   Hyprland adds focused-output detection for popups.
 - Optional: `notify-send` for notifications, `xdg-open` for `open` items, and
-  a signed-in `claude` or `codex` CLI for AI generation.
+  a signed-in `claude` or `codex` CLI for AI generation. Git is needed for
+  installing from repositories; Bash is needed for shell syntax checks.
+- Optional: Qt 6 `qmllint` for QML syntax, import and type checks during
+  installation and AI generation.
 
 ## Install
 
 ```sh
 git clone https://github.com/roke75/applets-for-quickshell.git
+mkdir -p ~/.local/bin
 ln -s "$PWD/applets-for-quickshell/bin/qsa" ~/.local/bin/qsa
 ```
 
 Keep the clone where it is: `qsa` and the Quickshell module are used from it.
-Below, `<repo>` stands for its folder.
+Ensure `~/.local/bin` is on your `PATH`. Below, `<repo>` stands for its folder.
 
 ### Embed in your Quickshell config (recommended)
 
@@ -159,11 +169,21 @@ qsa edit weather --ai "also show wind speed"
 The model gets `SPEC.md` and a few examples, and returns files as JSON. It has
 no tools, so it cannot run commands or touch other files. The CLI writes the
 files to a temporary folder and checks them without running anything: the
-manifest, `bash -n` for shell scripts, Python compilation, QML imports. If a
-check fails, the problems go back to the model, up to two times. You then see
+manifest, `bash -n` for shell scripts, Python syntax, and QML root declarations.
+When Qt 6 `qmllint` is available, QML syntax, imports and types are checked too.
+If a check fails, the problems go back to the model, up to two times. You then see
 the files (or a diff, for `edit`) and choose to install, test run (scripts
 only, with a throwaway data folder), or discard. Nothing generated runs or
 reaches `~/.config/applets` before you choose.
+
+A test run executes the script with your user permissions. The throwaway data
+folder keeps its applet data separate; it does not restrict access to other
+files. Review the script before choosing to run it.
+
+AI editing rejects applets containing symlinks so staged changes stay inside
+the applet folder. Accepted edits are copied completely before replacing the
+live folder. A failed switch triggers rollback; if rollback also fails, the
+original remains in a hidden `.name.swap-*/old` backup beside the applet.
 
 `--with claude|codex` picks the CLI (default: Claude if installed, else Codex).
 The CLI must be signed in; no API keys are stored. `--yes` skips the review,
@@ -188,7 +208,7 @@ The progress line shows which one is used, for example
 |---|---|
 | `qsa new <name> [--qml] [--surface S] [--bar \| --bar-qml]` | Create an applet from a template. |
 | `qsa new <name> --ai "…"`, `qsa edit <name> --ai "…"` | Write or change an applet with Claude or Codex, then review it. Also `--with`, `--model`, `-y`. |
-| `qsa install <folder\|git-url\|gh:user/repo> [-y]` | Copy an applet in, after showing its files. |
+| `qsa install <folder\|git-url\|gh:user/repo> [-y]` | Validate and install an applet after showing its checks and files. |
 | `qsa remove <name> [--keep-data] [-y]` | Delete an applet and its data folder, after confirming. |
 | `qsa list [--json]`, `qsa check [name]` | Show applets and validate manifests. |
 | `qsa run <name> [--action ID \| --input TEXT]` | Run a script applet once, without the shell, and print its output. |
@@ -263,13 +283,59 @@ order:
 | `runtime/Applets/` | The `qs.Applets` QML module: host, bar, surfaces, theme and components. |
 | `runtime/shell.qml` | The standalone runtime. |
 | `examples/` | Example applets. |
-| `tests/` | QML tests for keyboard handling; run `tests/run` (needs `qmltestrunner` from Qt 6). |
+| `tests/` | CLI regressions, QML keyboard tests and headless Quickshell process tests. |
 | `SPEC.md` | The applet format. Also the reference the AI generator receives. |
+
+## Testing
+
+From the repository directory:
+
+```sh
+tests/run                      # CLI regressions and QML keyboard tests
+python3 tests/test_runtime.py   # Quickshell process ordering and timeouts
+python3 tests/test_live.py      # real windows in an active Hyprland session
+```
+
+`tests/run` needs Python 3.11+, Bash and Qt 6 `qmltestrunner`. CLI tests can also
+be run on their own with `python3 tests/test_cli.py`; QML syntax rejection tests
+are skipped when Qt 6 `qmllint` is unavailable.
+
+The runtime tests need `qs` and Qt's QtTest QML module. They use temporary
+applets and replace window surfaces with stubs, so they do not need a Wayland
+compositor. A restricted sandbox must allow creation of the temporary IPC
+socket. None of the tests modify installed applets. Actual bar and window
+behavior still needs a manual check in a running Wayland shell.
+
+`test_live.py` opens a temporary bar, desktop widget and applet windows on
+Hyprland, then closes them. It checks compositor visibility, IPC, actions,
+input, timeout recovery, storage, reloads, creation and removal using isolated
+applet/data folders. It needs `hyprctl`, an active Wayland session, and desktop
+and IPC access when run in a sandbox. It does not simulate mouse or keyboard
+input, so bar clicks and keyboard behavior still need a manual visual check.
 
 ## Security
 
 Applets run as your user, without a sandbox. Only install applets you have
 read, and review generated ones before accepting them.
+
+`qsa install` rejects symlinks in both local folders and cloned repositories.
+Before review, it validates the manifest, Python and shell syntax, and QML
+imports and types with Qt 6 `qmllint` when available. The review lists the
+checks performed and reports when QML linting is unavailable. Other script
+languages receive manifest and entry-permission checks only. These are static
+checks: no applet code is run, and runtime behavior is not verified.
+
+Installation uses a hidden staging folder inside the applets directory. After
+approval, a Linux `renameat2` operation publishes the complete applet and
+refuses existing destinations, including ones created during review. Failed
+or cancelled installations leave no partial applet behind.
+
+`qsa remove` accepts one non-hidden folder name and rejects symlink applet
+folders. Before deleting anything, it checks both the applet and selected data
+folder, rejects data symlinks and overlapping config/data paths, and rechecks
+their identities after confirmation. Deletion uses pinned parent directories
+and does not follow symlinks inside either folder. `--keep-data` leaves the
+data path untouched.
 
 ## Not yet
 

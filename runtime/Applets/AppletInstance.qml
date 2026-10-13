@@ -35,7 +35,12 @@ Scope {
     property var state: ({})
     property string error: ""
     property date updated
-    readonly property bool busy: refresher.running || actor.running
+    // Process.running changes asynchronously when a process is started.
+    // Reserve the slot before starting it so back-to-back requests cannot race.
+    property bool runInProgress: false
+    readonly property bool busy: runInProgress || refresher.running || actor.running
+    property var pendingActors: []
+    property bool pendingRefresh: false
     // Short confirmation in the footer, such as "Copied", cleared after 2 s.
     property string notice: ""
 
@@ -145,13 +150,20 @@ Scope {
     }
 
     function refresh() {
-        if (!applet || !isScript || streams || refresher.running)
+        if (!applet || !isScript || streams)
             return;
 
+        if (busy || pendingActors.length) {
+            pendingRefresh = true;
+            return;
+        }
+        pendingRefresh = false;
+        runInProgress = true;
+        refresher.timedOut = false;
         refresher.environment = env("refresh");
         refresher.command = [applet.entry];
         refresher.running = true;
-        timeout.restart();
+        refreshTimeout.restart();
     }
 
     function runAction(id) {
@@ -163,13 +175,31 @@ Scope {
     }
 
     function startActor(argv, event) {
-        if (!applet || !isScript || actor.running)
+        if (!applet || !isScript)
             return;
 
-        actor.environment = env(event);
-        actor.command = argv;
-        actor.running = true;
-        timeout.restart();
+        pendingActors = pendingActors.concat([{ argv: argv, event: event }]);
+        drainRuns();
+    }
+
+    // Preserve user actions in order and coalesce refreshes while a run is busy.
+    function drainRuns() {
+        if (!applet || !isScript || busy)
+            return;
+
+        if (pendingActors.length) {
+            var next = pendingActors[0];
+            pendingActors = pendingActors.slice(1);
+            runInProgress = true;
+            actor.timedOut = false;
+            actor.environment = env(next.event);
+            actor.command = next.argv;
+            actor.running = true;
+            actionTimeout.restart();
+        } else if (pendingRefresh) {
+            pendingRefresh = false;
+            refresh();
+        }
     }
 
     function startStream() {
@@ -359,10 +389,14 @@ Scope {
     Process {
         id: refresher
 
+        property bool timedOut: false
         workingDirectory: host.applet ? host.applet.dir : ""
         onExited: code => {
-            timeout.stop();
-            host.handleOutput(refresherOut.text, code, refresherErr.text);
+            refreshTimeout.stop();
+            host.runInProgress = false;
+            if (!timedOut)
+                host.handleOutput(refresherOut.text, code, refresherErr.text);
+            Qt.callLater(host.drainRuns);
         }
 
         stdout: StdioCollector {
@@ -379,11 +413,14 @@ Scope {
     Process {
         id: actor
 
+        property bool timedOut: false
         workingDirectory: host.applet ? host.applet.dir : ""
         onExited: code => {
-            timeout.stop();
-            if (!host.handleOutput(actorOut.text, code, actorErr.text) && code === 0)
-                host.refresh();
+            actionTimeout.stop();
+            host.runInProgress = false;
+            if (!timedOut && !host.handleOutput(actorOut.text, code, actorErr.text) && code === 0)
+                host.pendingRefresh = true;
+            Qt.callLater(host.drainRuns);
         }
 
         stdout: StdioCollector {
@@ -438,14 +475,28 @@ Scope {
         onTriggered: host.notice = ""
     }
 
-    // Stops a hung refresh or action run. Streams have no time limit.
+    // Each run owns its deadline. Ignore its exit output after timing out so
+    // the termination status cannot replace the useful timeout message.
     Timer {
-        id: timeout
+        id: refreshTimeout
 
         interval: host.applet ? host.applet.timeout * 1000 : 20000
         onTriggered: {
-            if (refresher.running || actor.running) {
+            if (refresher.running) {
+                refresher.timedOut = true;
                 refresher.running = false;
+                host.error = "timed out after " + (host.applet ? host.applet.timeout : "?") + "s";
+            }
+        }
+    }
+
+    Timer {
+        id: actionTimeout
+
+        interval: host.applet ? host.applet.timeout * 1000 : 20000
+        onTriggered: {
+            if (actor.running) {
+                actor.timedOut = true;
                 actor.running = false;
                 host.error = "timed out after " + (host.applet ? host.applet.timeout : "?") + "s";
             }

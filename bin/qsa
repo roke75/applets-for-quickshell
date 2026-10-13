@@ -13,12 +13,16 @@ See SPEC.md for the applet format and README.md for usage.
 """
 
 import argparse
+import contextlib
+import ctypes
 import difflib
+import hashlib
 import json
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -185,16 +189,24 @@ def find(name):
 
 
 def revision(folder):
-    """Latest modification time of any file in an applet folder."""
-    latest = 0.0
+    """Fingerprint paths and metadata, including deletions and preserved mtimes.
+
+    A 48-bit integer remains exact in QML's double-precision revision property.
+    """
+    digest = hashlib.blake2b(digest_size=6)
     for root, dirs, files in os.walk(folder):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
-        for item in files:
+        dirs.sort()
+        for item in sorted(files):
             try:
-                latest = max(latest, os.stat(os.path.join(root, item)).st_mtime)
+                path = Path(root) / item
+                stat = path.lstat()
+                digest.update(json.dumps([str(path.relative_to(folder)), stat.st_mode,
+                                          stat.st_size, stat.st_mtime_ns,
+                                          stat.st_ctime_ns, stat.st_ino]).encode())
             except OSError:
                 pass
-    return latest
+    return int.from_bytes(digest.digest(), "big")
 
 
 def script_env(applet, event):
@@ -553,6 +565,8 @@ def parse_answer(text):
         if start < 0 or end < start:
             raise ValueError("the answer was not JSON")
         answer = json.loads(text[start:end + 1])
+    if not isinstance(answer, dict):
+        raise ValueError("the answer must be a JSON object")
     files = answer.get("files")
     delete = answer.get("delete", [])
     if not isinstance(files, dict) or not all(isinstance(v, str) for v in files.values()):
@@ -581,36 +595,98 @@ def strip_folder(files, delete, name):
             [path[len(prefix):] for path in delete])
 
 
-def text_files(folder):
+def text_files(folder, limit=MAX_FILE_BYTES):
     """Readable text files of an applet, relative path -> content."""
     found = {}
     for path in sorted(folder.rglob("*")):
         rel = path.relative_to(folder)
-        if not path.is_file() or any(p.startswith(".") or p == "__pycache__" for p in rel.parts):
+        if path.is_symlink() or not path.is_file() or any(p.startswith(".") or p == "__pycache__" for p in rel.parts):
             continue
         try:
             content = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
-        if len(content) <= MAX_FILE_BYTES:
+        if limit is None or len(content) <= limit:
             found[str(rel)] = content
     return found
 
 
+def reject_symlinks(folder):
+    """Reject links before an applet is read, edited or installed."""
+    if folder.is_symlink():
+        raise ValueError(f"symlinks are not supported: {folder.name}")
+    for root, dirs, files in os.walk(folder, followlinks=False):
+        for name in dirs + files:
+            path = Path(root) / name
+            if path.is_symlink():
+                raise ValueError(f"symlinks are not supported: {path.relative_to(folder)}")
+
+
+def staging_path(folder, path):
+    """Validate generated paths again at the write boundary, without following links."""
+    parts = Path(path).parts
+    if not parts or Path(path).is_absolute() or any(p == ".." or p.startswith(".") for p in parts):
+        raise ValueError(f"unsafe path: {path!r}")
+    target = folder
+    if folder.is_symlink():
+        raise ValueError("the staging folder must not be a symlink")
+    for part in parts:
+        target = target / part
+        if target.is_symlink():
+            raise ValueError(f"unsafe symlink path: {path!r}")
+    if folder.resolve() not in target.resolve().parents:
+        raise ValueError(f"path escapes staging: {path!r}")
+    return target
+
+
 def apply_files(folder, files, delete):
+    # Validate the entire batch before applying any of it.
+    targets = {path: staging_path(folder, path) for path in [*files, *delete]}
     for path in delete:
-        target = folder / path
+        target = targets[path]
         if target.is_file():
             target.unlink()
     for path, content in files.items():
-        target = folder / path
+        target = targets[path]
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         if content.startswith("#!"):
             target.chmod(0o755)
 
 
-def static_problems(folder, name):
+def replace_applet(staging, target):
+    """Prepare a complete replacement on the same filesystem, with rollback."""
+    reject_symlinks(staging)
+    tmp = Path(tempfile.mkdtemp(prefix=f".{target.name}.swap-", dir=target.parent))
+    prepared, old = tmp / "new", tmp / "old"
+    try:
+        shutil.copytree(staging, prepared)
+        try:
+            target.rename(old)
+            prepared.rename(target)
+        except BaseException:
+            if old.exists():
+                old.rename(target)
+            raise
+        shutil.rmtree(old)
+    finally:
+        # If rollback itself fails, retain the original for manual recovery.
+        if not old.exists():
+            shutil.rmtree(tmp)
+
+
+def qml_linter():
+    """Prefer Qt 6; a Qt 5 linter cannot validate our Qt 6 QML syntax."""
+    for candidate in ("/usr/lib/qt6/bin/qmllint", shutil.which("qmllint6"), shutil.which("qmllint")):
+        if not candidate or not os.access(candidate, os.X_OK):
+            continue
+        version = subprocess.run([candidate, "--version"], capture_output=True, text=True)
+        if re.search(r"\b6\.\d", version.stdout + version.stderr):
+            return candidate
+    return None
+
+
+def static_problems(folder, name, checks=None):
     """Problems found in a staged applet without running any of its code."""
     problems = []
     applet, error = load(folder)
@@ -620,23 +696,67 @@ def static_problems(folder, name):
         return [f"applet.toml: {error}"]
     if applet["name"] != name:
         problems.append(f"applet.toml: name must be {name!r}")
-    for rel, content in text_files(folder).items():
+    if checks is not None:
+        checks.append("manifest and entry permissions")
+    qml_files = []
+    qml_roots = {applet["entry"], applet["barEntry"]}
+    for rel, content in text_files(folder, limit=None).items():
         shebang = content.split("\n", 1)[0] if content.startswith("#!") else ""
         if rel.endswith(".py") or "python" in shebang:
             try:
                 compile(content, rel, "exec")  # parses only; nothing runs
+                if checks is not None:
+                    checks.append(f"{rel}: Python syntax")
             except SyntaxError as error:
                 problems.append(f"{rel}:{error.lineno}: {error.msg}")
         elif rel.endswith(".sh") or re.search(r"\b(ba)?sh\b", shebang):
-            checked = subprocess.run(["bash", "-n", str(folder / rel)], capture_output=True, text=True)
+            # Syntax checking must not source a caller's shell startup file.
+            env = {key: value for key, value in os.environ.items() if key not in ("BASH_ENV", "ENV")}
+            checked = subprocess.run(["bash", "--noprofile", "--norc", "-n", str(folder / rel)],
+                                     env=env, capture_output=True, text=True)
             if checked.returncode:
                 problems.append(checked.stderr.strip().replace(str(folder) + "/", ""))
+            elif checks is not None:
+                checks.append(f"{rel}: shell syntax")
         elif rel.endswith(".qml"):
-            if "required property var applet" not in content:
+            qml_files.append(folder / rel)
+            if str((folder / rel).resolve()) in qml_roots and not re.search(r"\brequired\s+property\s+var\s+applet\b", content):
                 problems.append(f"{rel}: the root item must declare `required property var applet`")
             if re.search(r"^import\s+Applets\b", content, re.M):
                 problems.append(f"{rel}: import the module as `import qs.Applets`")
+    if qml_files:
+        linter = qml_linter()
+        if linter:
+            with tempfile.TemporaryDirectory(prefix="applet-lint-") as tmp:
+                module = Path(tmp) / "qs" / "Applets"
+                module.parent.mkdir()
+                module.symlink_to(RUNTIME / "Applets", target_is_directory=True)
+                checked = subprocess.run([linter, "--ignore-settings", "-I", tmp,
+                                          "--import", "error", "--unresolved-type", "error",
+                                          *map(str, qml_files)], capture_output=True, text=True)
+            if checked.returncode:
+                problems.append("QML lint: " + (checked.stdout + checked.stderr).strip().replace(str(folder) + "/", ""))
+            elif checks is not None:
+                checks.append("QML syntax, imports and types (Qt 6 qmllint)")
+        elif checks is not None:
+            checks.append("QML root declarations; full QML lint skipped (Qt 6 qmllint unavailable)")
     return problems
+
+
+def publish_applet(staging, target):
+    """Atomically publish a directory without replacing a concurrent install.
+
+    Quickshell targets Linux; renameat2(RENAME_NOREPLACE) closes the race that
+    exists between checking a destination and an ordinary rename.
+    """
+    rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if rename is None:
+        raise OSError("atomic installation requires Linux renameat2 support")
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(-100, os.fsencode(staging), -100, os.fsencode(target), 1) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(target))
 
 
 def guide():
@@ -662,11 +782,11 @@ def generate(ai, prompt, staging, name):
         text = ask_model(ai, prompt)
         try:
             files, delete, summary = parse_answer(text)
+            files, delete = strip_folder(files, delete, name)
+            apply_files(staging, files, delete)
         except (ValueError, json.JSONDecodeError) as error:
             problems = [f"invalid answer: {error}"]
         else:
-            files, delete = strip_folder(files, delete, name)
-            apply_files(staging, files, delete)
             problems = static_problems(staging, name)
         if not problems:
             return summary
@@ -739,6 +859,7 @@ def review(staging, assume_yes):
         if choice in ("d", "discard", "n", "no", ""):
             return False
         if choice in ("t", "test") and script:
+            print("Test run executes with your user permissions. Temporary APPLET_DATA does not restrict file access.")
             test_run(staging, applet)
 
 
@@ -832,10 +953,16 @@ def cmd_new_ai(args):
 
 def cmd_edit(args):
     require_review_terminal(args)
-    ai = resolve_ai(args)
+    if not NAME_RE.fullmatch(args.name):
+        die("'name' must be lowercase letters, digits and dashes (up to 40 characters)")
     target = applets_home() / args.name
     if not target.is_dir():
         die(f"no applet named '{args.name}' in {applets_home()}")
+    try:
+        reject_symlinks(target)
+    except ValueError as error:
+        die(str(error))
+    ai = resolve_ai(args)
     before = text_files(target)
     prompt = (f"{guide()}\nChange the existing applet {args.name!r}. Return only files you create "
               "or change, with complete contents, and list removed files in \"delete\". "
@@ -852,12 +979,7 @@ def cmd_edit(args):
         if not review(staging, args.yes):
             print("Discarded; the applet is unchanged.")
             return
-        # Swap whole folders so the shell never loads a half-written applet.
-        # The dot-prefixed old copy is ignored by scans until it is removed.
-        old = target.with_name(f".{args.name}.old-{os.getpid()}")
-        target.rename(old)
-        shutil.copytree(staging, target, symlinks=True)
-        shutil.rmtree(old)
+        replace_applet(staging, target)
     print(f"Updated {target}")
 
 
@@ -865,23 +987,39 @@ def cmd_install(args):
     source = args.source
     if source.startswith("gh:"):
         source = f"https://github.com/{source[3:]}.git"
-    with tempfile.TemporaryDirectory() as tmp:
+    home = applets_home()
+    home.mkdir(parents=True, exist_ok=True)
+    # Hidden from the watcher and on the destination filesystem, so publishing
+    # can never fall back to a partial copy into the live applet directory.
+    with tempfile.TemporaryDirectory(prefix=".install-", dir=home) as tmp:
         staged = Path(tmp) / "applet"
         if Path(source).is_dir():
-            shutil.copytree(source, staged, ignore=shutil.ignore_patterns(".git"))
+            try:
+                reject_symlinks(Path(source))
+            except ValueError as error:
+                die(str(error))
+            try:
+                shutil.copytree(source, staged, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+            except OSError as error:
+                die(f"could not stage applet: {error}")
         else:
-            cloned = subprocess.run(["git", "clone", "--depth", "1", "--quiet", source, str(staged)])
+            cloned = subprocess.run(["git", "clone", "--depth", "1", "--quiet", "--", source, str(staged)])
             if cloned.returncode:
                 die(f"could not clone {source}")
+        try:
+            reject_symlinks(staged)
+        except ValueError as error:
+            die(str(error))
+        if (staged / ".git").is_dir():
             shutil.rmtree(staged / ".git", ignore_errors=True)
         try:
             name = tomllib.loads((staged / MANIFEST).read_text()).get("name", "")
-        except (OSError, tomllib.TOMLDecodeError) as error:
+        except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
             die(f"cannot read {MANIFEST}: {error}")
-        if not isinstance(name, str) or not NAME_RE.match(name):
+        if not isinstance(name, str) or not NAME_RE.fullmatch(name):
             die("the manifest needs a valid 'name'")
-        target = applets_home() / name
-        if target.exists():
+        target = home / name
+        if target.exists() or target.is_symlink():
             die(f"{target} already exists; remove it first to reinstall")
         # load() requires the folder name to match the manifest name.
         named = Path(tmp) / name
@@ -889,40 +1027,96 @@ def cmd_install(args):
         applet, error = load(named)
         if error:
             die(f"{name}: {error}")
+        checks = []
+        problems = static_problems(named, name, checks)
+        if problems:
+            die(f"{name}: validation failed:\n" + "\n".join(f"  {p}" for p in problems))
         surface = applet["surface"] if applet["entry"] else "bar only"
         print(f"{name}: {applet['title']} ({applet['kind']}, {surface})")
         if applet["description"]:
             print(f"  {applet['description']}")
+        print("  Checks: " + "; ".join(checks))
         print("  Applets run with your user permissions. Files:")
         for item in sorted(p for p in named.rglob("*") if p.is_file()):
             print(f"    {item.relative_to(named)}")
         if not args.yes and input("Install? [y/N] ").strip().lower() != "y":
             die("cancelled")
-        applets_home().mkdir(parents=True, exist_ok=True)
-        shutil.move(str(named), target)
+        try:
+            publish_applet(named, target)
+        except OSError as error:
+            die(f"could not install {name}: {error}")
     print(f"Installed to {target}")
 
 
 def cmd_remove(args):
+    # Invalid manifests may still be removed, but the argument must be one
+    # visible folder name, never a path or a symlink alias.
+    name = args.name
+    if not name or name.startswith(".") or Path(name).name != name or any(ord(c) < 32 for c in name):
+        die("remove expects one non-hidden applet folder name, not a path")
     home = applets_home().resolve()
-    folder = (home / args.name).resolve()
-    # Also removes invalid applets, so only require a folder directly inside.
-    if folder.parent != home or not folder.is_dir() or args.name.startswith("."):
-        die(f"no applet named '{args.name}' in {home}")
+    folder = home / name
+    if folder.is_symlink():
+        die(f"refusing to remove a symlink applet folder: {folder}")
+    if not folder.is_dir():
+        die(f"no applet named '{name}' in {home}")
     if not args.yes and not sys.stdin.isatty():
         die("confirmation needs a terminal; pass --yes to remove without asking")
-    data = data_dir(folder.name)
-    targets = [folder] + ([data] if data.is_dir() and not args.keep_data else [])
-    print("Removes:")
-    for target in targets:
-        print(f"  {target}")
-    if data.is_dir() and args.keep_data:
-        print(f"Keeps its data: {data}")
-    if not args.yes and input("Remove? [y/N] ").strip().lower() != "y":
-        die("cancelled")
-    for target in targets:
-        shutil.rmtree(target)
-    print(f"Removed {folder.name}")
+    data = data_dir(name)
+    targets = [folder]
+    if not args.keep_data:
+        if data.parent.is_symlink() or data.is_symlink():
+            die(f"refusing to remove data through a symlink: {data}")
+        if data.exists() and not data.is_dir():
+            die(f"applet data is not a directory: {data}")
+        if data.is_dir():
+            data = data.parent.resolve() / name
+            targets.append(data)
+    # Overlapping paths can destroy kept data or unrelated applets when the
+    # config and data roots are accidentally pointed into one another.
+    resolved_data = data.resolve()
+    if resolved_data == folder or folder in resolved_data.parents or resolved_data in folder.parents:
+        die("applet and data folders overlap; correct APPLETS_HOME/XDG_DATA_HOME before removing")
+    if not shutil.rmtree.avoids_symlink_attacks:
+        die("safe removal requires symlink-resistant directory deletion")
+
+    # Pin each parent directory and record the child's identity before asking.
+    # Recheck every target before deleting any, so changes during confirmation
+    # cannot redirect removal to a sibling or an external directory.
+    with contextlib.ExitStack() as stack:
+        pinned = []
+        try:
+            for target in targets:
+                fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                stack.callback(os.close, fd)
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if not stat.S_ISDIR(info.st_mode):
+                    die(f"refusing to remove a non-directory: {target}")
+                parent_info = os.fstat(fd)
+                pinned.append((target, fd, (info.st_dev, info.st_ino),
+                               (parent_info.st_dev, parent_info.st_ino)))
+        except OSError as error:
+            die(f"cannot validate removal targets: {error}")
+        print("Removes:")
+        for target in targets:
+            print(f"  {target}")
+        if args.keep_data:
+            print(f"Keeps its data: {data}")
+        if not args.yes and input("Remove? [y/N] ").strip().lower() != "y":
+            die("cancelled")
+        try:
+            for target, fd, identity, parent_identity in pinned:
+                parent_info = os.stat(target.parent, follow_symlinks=False)
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if (not stat.S_ISDIR(parent_info.st_mode)
+                        or (parent_info.st_dev, parent_info.st_ino) != parent_identity
+                        or not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != identity):
+                    die(f"removal target changed; nothing removed: {target}")
+        except OSError as error:
+            die(f"removal target changed; nothing removed: {error}")
+        for target, fd, identity, parent_identity in pinned:
+            shutil.rmtree(name, dir_fd=fd)
+    print(f"Removed {name}")
 
 
 def cmd_list(args):

@@ -268,3 +268,18 @@ Applets are ordinary programs that run with your user account, without a
 sandbox. `qsa install` lists an applet's files and asks before installing,
 and `qsa new --ai` / `qsa edit --ai` show the generated files or diff
 before anything runs or is installed. Read them before you accept.
+
+Installation rejects symlinks, checks the manifest and supported script syntax,
+and uses Qt 6 `qmllint` for QML when available. The review reports the checks
+performed, including skipped QML linting. Helper QML components do not need an
+`applet` property; the QML entry and custom bar root do. Static checks do not
+execute applets or guarantee their runtime behavior. Accepted installations
+appear as a complete folder and never replace an existing applet.
+
+Removal rejects path arguments and symlink applet folders. Selected applet
+and data deletion targets are checked before either is removed; data symlinks
+and overlapping config/data paths are rejected. Changes to either target or
+its parent during confirmation abort removal. Symlinks inside deleted folders
+are removed as links, without following them. `--keep-data` preserves the data
+path. An AI review's test-run option executes with user permissions; temporary
+applet data is not a filesystem sandbox.
