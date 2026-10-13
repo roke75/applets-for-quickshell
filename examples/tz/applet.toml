@@ -1,0 +1,12 @@
+name = "tz"
+title = "Time zones"
+description = "Current time in a few places. Click a row to copy it."
+entry = "main.py"
+interval = 30
+key = "SUPER + CTRL + T"
+bar = true
+icon = "◷"
+width = 360
+
+[config]
+zones = ["UTC", "Europe/London", "America/New_York", "America/Los_Angeles", "Asia/Tokyo"]

@@ -1,0 +1,17 @@
+module qs.Applets
+singleton AppletTheme 1.0 AppletTheme.qml
+AppletsHost 1.0 AppletsHost.qml
+AppletBar 1.0 AppletBar.qml
+AppletText 1.0 AppletText.qml
+AppletButton 1.0 AppletButton.qml
+AppletField 1.0 AppletField.qml
+internal AppletInstance AppletInstance.qml
+internal AppletCard AppletCard.qml
+internal AppletContent AppletContent.qml
+internal AppletQmlItem AppletQmlItem.qml
+internal AppletScriptView AppletScriptView.qml
+internal AppletChip AppletChip.qml
+internal AppletPopup AppletPopup.qml
+internal AppletAnchoredPopup AppletAnchoredPopup.qml
+internal AppletWindow AppletWindow.qml
+internal AppletDesktop AppletDesktop.qml

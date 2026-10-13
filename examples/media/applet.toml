@@ -1,0 +1,4 @@
+name = "media"
+title = "Media"
+description = "Now playing in the bar, with artwork and controls on hover."
+bar = "Media.qml"

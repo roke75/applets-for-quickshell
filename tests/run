@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Runs the QML tests against a temporary copy of runtime/Applets in which
+# internal types are exported and AppletTheme is replaced by StubTheme.qml.
+# Needs qmltestrunner (qt6-declarative); no display is required.
+set -euo pipefail
+tests=$(cd "$(dirname "$0")" && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+module="$work/qs/Applets"
+mkdir -p "$module"
+cp "$tests"/../runtime/Applets/* "$module/"
+cp "$tests/StubTheme.qml" "$module/AppletTheme.qml"
+sed -i -E 's/^internal (\w+) (\S+)$/\1 1.0 \2/' "$module/qmldir"
+
+# Prefer Qt 6's runner: a plain `qmltestrunner` on PATH may belong to Qt 5.
+runner=/usr/lib/qt6/bin/qmltestrunner
+[[ -x $runner ]] || runner=$(command -v qmltestrunner6 || command -v qmltestrunner)
+QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-offscreen} "$runner" -import "$work" -input "$tests"

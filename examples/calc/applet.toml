@@ -1,0 +1,7 @@
+name = "calc"
+title = "Calculator"
+description = "Type an expression; Enter evaluates it. History is kept; click to copy."
+entry = "main.py"
+input = true
+placeholder = "2^10 / 3, sqrt(2), 15% of 80…"
+key = "SUPER + CTRL + C"

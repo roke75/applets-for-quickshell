@@ -1,0 +1,12 @@
+name = "countdown"
+title = "Countdown"
+description = "Days until a date, as a desktop widget. Click to edit."
+entry = "Countdown.qml"
+surface = "desktop"
+position = "top-right"
+width = 240
+height = 130
+
+[config]
+label = "New Year"
+date = "2027-01-01"

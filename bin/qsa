@@ -1,0 +1,1184 @@
+#!/usr/bin/env python3
+"""qsa: the command-line tool of Applets for Quickshell.
+
+Creates, checks, runs and controls tiny desktop applets.
+
+Applets live in $APPLETS_HOME (default $XDG_CONFIG_HOME/applets), one folder
+per applet with an applet.toml manifest. The Quickshell module in
+runtime/Applets hosts them, embedded in a shell (`qsa setup`) or in the
+standalone runtime (`qsa daemon`). This CLI also feeds that module the
+applet registry (`qsa watch`) and talks to it over Quickshell IPC.
+
+See SPEC.md for the applet format and README.md for usage.
+"""
+
+import argparse
+import difflib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+RUNTIME = REPO / "runtime"
+MANIFEST = "applet.toml"
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+SURFACES = ("popup", "floating", "desktop")
+POSITIONS = ("top-left", "top", "top-right", "left", "center", "right",
+             "bottom-left", "bottom", "bottom-right")
+LAYERS = ("below", "above")
+
+
+def xdg(var, fallback):
+    return Path(os.environ.get(var) or Path.home() / fallback)
+
+
+def applets_home():
+    return Path(os.environ.get("APPLETS_HOME") or xdg("XDG_CONFIG_HOME", ".config") / "applets")
+
+
+def data_dir(name):
+    return xdg("XDG_DATA_HOME", ".local/share") / "applets" / name
+
+
+def die(message):
+    print(f"qsa: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+# Manifests --------------------------------------------------------------------
+
+def load(folder):
+    """Return (applet, None) or (None, error) for one applet folder.
+
+    The applet dict is the normalized manifest the QML module consumes: paths
+    are absolute, `bar` is "none", "chip" or "qml", and defaults are filled in.
+    """
+    folder = Path(folder)
+    try:
+        raw = tomllib.loads((folder / MANIFEST).read_text())
+    except FileNotFoundError:
+        return None, f"missing {MANIFEST}"
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+        return None, f"{MANIFEST}: {error}"
+
+    def field(key, kind, default):
+        value = raw.get(key, default)
+        # bool is a subclass of int, so `true` must not pass as an int.
+        if not isinstance(value, kind) or isinstance(value, bool) and kind is not bool:
+            raise ValueError(f"'{key}' must be {kind.__name__}")
+        return value
+
+    def inside(key, value):
+        path = (folder / value).resolve()
+        if folder.resolve() not in path.parents:
+            raise ValueError(f"'{key}' must stay inside the applet folder")
+        if not path.is_file():
+            raise ValueError(f"{key} '{value}' does not exist")
+        return path
+
+    try:
+        name = field("name", str, folder.name)
+        if not NAME_RE.match(name):
+            raise ValueError("'name' must be lowercase letters, digits and dashes")
+        if name != folder.name:
+            raise ValueError(f"'name' ({name}) must match its folder ({folder.name})")
+
+        bar_raw = raw.get("bar", False)
+        if isinstance(bar_raw, bool):
+            bar, bar_entry = ("chip" if bar_raw else "none"), ""
+        elif isinstance(bar_raw, str) and bar_raw.endswith(".qml"):
+            bar, bar_entry = "qml", str(inside("bar", bar_raw))
+        else:
+            raise ValueError("'bar' must be true, false or a .qml file")
+
+        entry = field("entry", str, "")
+        if not entry and bar != "qml":
+            raise ValueError("'entry' is required unless 'bar' names a .qml file")
+        entry_path = inside("entry", entry) if entry else None
+        # A bar-only applet has no entry; it counts as QML.
+        kind = "qml" if not entry_path or entry_path.suffix == ".qml" else "script"
+        if kind == "script" and not os.access(entry_path, os.X_OK):
+            raise ValueError(f"script entry '{entry}' is not executable (chmod +x)")
+
+        surface = field("surface", str, "popup")
+        if surface not in SURFACES:
+            raise ValueError(f"'surface' must be one of {', '.join(SURFACES)}")
+        position = field("position", str, "top-right")
+        if position not in POSITIONS:
+            raise ValueError(f"'position' must be one of {', '.join(POSITIONS)}")
+        layer = field("layer", str, "below")
+        if layer not in LAYERS:
+            raise ValueError(f"'layer' must be one of {', '.join(LAYERS)}")
+        interval = field("interval", int, 0)
+        timeout = field("timeout", int, 20)
+        if interval < 0 or timeout <= 0:
+            raise ValueError("'interval' must be >= 0 and 'timeout' > 0")
+
+        applet = {
+            "name": name,
+            "title": field("title", str, name),
+            "description": field("description", str, ""),
+            "dir": str(folder.resolve()),
+            "entry": str(entry_path) if entry_path else "",
+            "kind": kind,
+            "icon": field("icon", str, ""),
+            "bar": bar,
+            "barEntry": bar_entry,
+            "surface": surface,
+            "position": position,
+            "layer": layer,
+            "screen": field("screen", str, ""),
+            "width": field("width", int, 420),
+            "height": field("height", int, 0),
+            "interval": interval,
+            "timeout": timeout,
+            "stream": field("stream", bool, False),
+            "input": field("input", bool, False),
+            "placeholder": field("placeholder", str, ""),
+            "key": field("key", str, ""),
+            "config": field("config", dict, {}),
+            "dataDir": str(data_dir(name)),
+        }
+        if kind == "qml" and (applet["stream"] or applet["input"] or applet["interval"]):
+            raise ValueError("'stream', 'input' and 'interval' apply to script applets only")
+    except ValueError as error:
+        return None, str(error)
+    return applet, None
+
+
+def applet_folders():
+    home = applets_home()
+    if not home.is_dir():
+        return []
+    return sorted(p for p in home.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+
+def scan():
+    """All applets as (valid applets, [{name, error}] for invalid ones)."""
+    applets, invalid = [], []
+    for folder in applet_folders():
+        applet, error = load(folder)
+        if error:
+            invalid.append({"name": folder.name, "error": error})
+        else:
+            applets.append(applet)
+    return applets, invalid
+
+
+def find(name):
+    folder = applets_home() / name
+    if not folder.is_dir():
+        die(f"no applet named '{name}' in {applets_home()}")
+    applet, error = load(folder)
+    if error:
+        die(f"{name}: {error}")
+    return applet
+
+
+def revision(folder):
+    """Latest modification time of any file in an applet folder."""
+    latest = 0.0
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+        for item in files:
+            try:
+                latest = max(latest, os.stat(os.path.join(root, item)).st_mtime)
+            except OSError:
+                pass
+    return latest
+
+
+def script_env(applet, event):
+    """Environment for a script run (SPEC.md "Invocation")."""
+    env = dict(os.environ)
+    env.update({
+        "APPLET_NAME": applet["name"],
+        "APPLET_DIR": applet["dir"],
+        "APPLET_DATA": applet["dataDir"],
+        "APPLET_CONFIG": json.dumps(applet["config"]),
+        "APPLET_EVENT": event,
+    })
+    return env
+
+
+# Quickshell -------------------------------------------------------------------
+
+def require_qs():
+    if not shutil.which("qs"):
+        die("Quickshell (qs) is not installed")
+
+
+def runtime_running():
+    listing = subprocess.run(["qs", "list", "-p", str(RUNTIME)], capture_output=True, text=True)
+    return listing.returncode == 0 and "No running instances" not in listing.stdout + listing.stderr
+
+
+def shell_target():
+    """qs arguments selecting the instance that hosts applets.
+
+    APPLETS_SHELL (a config path) wins; then a running standalone runtime;
+    otherwise the default Quickshell config, where applets are embedded.
+    """
+    if os.environ.get("APPLETS_SHELL"):
+        return ["-p", os.path.expanduser(os.environ["APPLETS_SHELL"])]
+    if runtime_running():
+        return ["-p", str(RUNTIME)]
+    return []
+
+
+def hosts_applets(target):
+    """Whether the selected instance runs an AppletsHost (its IPC target)."""
+    shown = subprocess.run(["qs", "ipc", *target, "show"], capture_output=True, text=True)
+    return shown.returncode == 0 and re.search(r"^target applets$", shown.stdout, re.M) is not None
+
+
+def ipc(*call):
+    """Call an `applets` IPC function, which answers "ok" or an error."""
+    require_qs()
+    target = shell_target()
+    if not hosts_applets(target):
+        die("no running Quickshell hosts applets; start `qsa daemon -d` or embed them (`qsa setup`)")
+    # A just-created applet appears within the shell's next scan (about a
+    # second), so retry briefly while its folder exists.
+    deadline = time.monotonic() + 3
+    while True:
+        result = subprocess.run(["qs", "ipc", *target, "call", "applets", *call],
+                                capture_output=True, text=True)
+        reply = (result.stdout + result.stderr).strip()
+        pending = reply.startswith("unknown") and (applets_home() / call[1]).is_dir()
+        if not pending or time.monotonic() > deadline:
+            break
+        time.sleep(0.2)
+    if result.returncode or reply != "ok":
+        die(reply or f"qs ipc failed with code {result.returncode}")
+
+
+# Templates for `qsa new` ---------------------------------------------------
+
+SCRIPT_TEMPLATE = """#!/usr/bin/env bash
+# Prints one JSON state object. Called as:
+#   main.sh               refresh (also on each interval)
+#   main.sh action <id>   when an item with "run": "<id>" is chosen
+set -euo pipefail
+
+if [[ "${1:-}" == action ]]; then
+    notify-send "$APPLET_NAME" "You chose $2"
+    exit 0
+fi
+
+cat <<JSON
+{
+  "text": "$(date +%H:%M)",
+  "items": [
+    {"text": "Say hello", "detail": "runs an action", "run": "hello"},
+    {"text": "Copy the date", "detail": "$(date +%F)", "copy": "$(date +%F)"}
+  ]
+}
+JSON
+"""
+
+QML_TEMPLATE = """import QtQuick
+import qs.Applets
+
+// `applet` is the runtime API (SPEC.md "QML applets"): config, store, notify(),
+// run(), close() and more. Size comes from width/height in applet.toml.
+Item {
+    required property var applet
+
+    Column {
+        anchors.centerIn: parent
+        spacing: 12
+
+        AppletText {
+            text: "Hello from " + applet.name
+            font.pixelSize: AppletTheme.fontSize + 6
+        }
+
+        AppletButton {
+            text: "Clicked " + applet.store.get("clicks", 0) + " times"
+            onClicked: applet.store.set("clicks", applet.store.get("clicks", 0) + 1)
+        }
+    }
+}
+"""
+
+BAR_QML_TEMPLATE = """import QtQuick
+import qs.Applets
+
+// A bar-only applet: this item is placed in each AppletBar, one per bar.
+// It sizes itself; the bar follows its width. All of Quickshell is available
+// (for example Quickshell.Services.Mpris for a media player).
+Item {
+    id: root
+
+    required property var applet
+
+    width: label.implicitWidth + 16
+    height: 24
+
+    Rectangle {
+        anchors.fill: parent
+        radius: AppletTheme.rounding
+        color: hover.hovered ? AppletTheme.surfaceAlt : "transparent"
+    }
+
+    AppletText {
+        id: label
+
+        anchors.centerIn: parent
+        text: "● " + root.applet.title
+        color: AppletTheme.accent
+    }
+
+    HoverHandler {
+        id: hover
+    }
+
+    TapHandler {
+        onTapped: root.applet.notify(root.applet.title, "Edit Bar.qml in " + root.applet.dir)
+    }
+}
+"""
+
+
+# AI generation ----------------------------------------------------------------
+#
+# The model never gets tools: it returns files as JSON, the CLI writes them to
+# a staging folder and checks them statically (nothing generated is executed),
+# and the user reviews the result before it reaches the applets folder.
+
+AI_TIMEOUT = 300
+AI_REPAIRS = 2
+MAX_FILES = 20
+MAX_FILE_BYTES = 100_000
+PROVIDERS = ("claude", "codex")
+
+# The running model CLI, so Ctrl-C and timeouts can stop its process group.
+CHILD = None
+
+AI_GUIDE = """You write applets: tiny desktop apps for a Quickshell (Wayland) desktop.
+The full format specification follows, then example applets.
+
+<spec>
+{spec}
+</spec>
+
+<examples>
+{examples}
+</examples>
+
+Rules:
+- Prefer a script applet (bash or python3 standard library) printing JSON.
+  Use QML only for visuals a list cannot show (custom bar items, graphics).
+- Scripts may use common tools: bash, python3, curl, jq, coreutils, git,
+  notify-send. Use `curl --max-time 10` for network requests. Never ask for or
+  embed secrets or API keys; prefer services that need none.
+- Store state in $APPLET_DATA, settings in [config].
+- QML: `import qs.Applets`, root declares `required property var applet`, use
+  AppletTheme colors and AppletText/AppletButton/AppletField. Quickshell
+  modules (Quickshell, Quickshell.Io, Quickshell.Services.Mpris, ...) are available.
+- Keep it small and readable, with brief comments where intent is unclear.
+- Interface text is English.
+
+Answer with ONLY one JSON object, no markdown, no explanation:
+{{"summary": "one sentence describing what you built or changed",
+  "files": {{"relative/path": "complete file contents", ...}},
+  "delete": ["relative/path", ...]}}
+Paths are relative to the applet folder itself, such as "applet.toml" and
+"main.sh". Never prefix them with the applet's name.
+"""
+
+
+def find_cli(provider):
+    """Path of the claude/codex CLI, also checking ~/.local/bin, or None."""
+    local = Path.home() / ".local/bin" / provider
+    if shutil.which(provider):
+        return shutil.which(provider)
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    return None
+
+
+def pick_provider(choice):
+    if choice:
+        if not find_cli(choice):
+            die(f"{choice} CLI not found; install it and sign in first")
+        return choice
+    for provider in PROVIDERS:
+        if find_cli(provider):
+            return provider
+    die("neither the claude nor the codex CLI is installed")
+
+
+def configured_model(provider):
+    """The model (and Codex reasoning effort) set in the CLI's own config.
+
+    Only these values are read; everything else in the config stays ignored.
+    Returns (None, None) when nothing is set or the file cannot be read.
+    """
+    try:
+        if provider == "codex":
+            home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+            config = tomllib.loads((home / "config.toml").read_text())
+            profile = config.get("profiles", {}).get(config.get("profile", ""), {})
+            model = profile.get("model", config.get("model"))
+            effort = profile.get("model_reasoning_effort", config.get("model_reasoning_effort"))
+        else:
+            home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+            model, effort = json.loads((home / "settings.json").read_text()).get("model"), None
+    except (OSError, ValueError, AttributeError):
+        return None, None
+
+    def text(value):
+        return value if isinstance(value, str) and value else None
+
+    return text(model), text(effort)
+
+
+def resolve_ai(args):
+    """Provider, model and effort for a generation run, with where the model came from.
+
+    Precedence: --model, then QSA_CLAUDE_MODEL / QSA_CODEX_MODEL, then the
+    model in the CLI's own config, then the CLI's default.
+    """
+    provider = pick_provider(args.provider)
+    model, effort = configured_model(provider)
+    source = "from your CLI config" if model else "CLI default"
+    variable = f"QSA_{provider.upper()}_MODEL"
+    if args.model:
+        model, source = args.model, "from --model"
+    elif os.environ.get(variable):
+        model, source = os.environ[variable], f"from {variable}"
+    return {"provider": provider, "model": model, "effort": effort, "source": source}
+
+
+def describe_ai(ai):
+    name = ai["provider"].capitalize()
+    return f"{name} ({ai['model']}, {ai['source']})" if ai["model"] else f"{name} ({ai['source']} model)"
+
+
+def stop_child():
+    if CHILD and CHILD.poll() is None:
+        try:
+            os.killpg(CHILD.pid, signal.SIGTERM)
+            CHILD.wait(timeout=3)
+        except ProcessLookupError:
+            pass
+        except subprocess.TimeoutExpired:
+            os.killpg(CHILD.pid, signal.SIGKILL)
+
+
+def run_provider(command, stdin, cwd):
+    global CHILD
+    CHILD = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, cwd=cwd, start_new_session=True)
+    try:
+        output, errors = CHILD.communicate(stdin, timeout=AI_TIMEOUT)
+        return CHILD.returncode, output, errors
+    except subprocess.TimeoutExpired:
+        die(f"the model did not answer within {AI_TIMEOUT // 60} minutes")
+    finally:
+        stop_child()
+        CHILD = None
+
+
+def ask_model(ai, prompt):
+    """Send one prompt with every tool disabled; return the final text.
+
+    Both CLIs run in an empty temporary folder without user configuration,
+    MCP servers or session history, and use the CLI's existing login. Only the
+    model and effort from resolve_ai() are passed on.
+    """
+    executable = find_cli(ai["provider"])
+    with tempfile.TemporaryDirectory(prefix="applet-ai-") as workspace:
+        if ai["provider"] == "codex":
+            answer = Path(workspace) / "answer.txt"
+            command = [
+                executable, "exec", "--ignore-user-config", "--ephemeral",
+                "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never",
+                "--disable", "shell_tool", "--disable", "unified_exec", "--disable", "hooks",
+                "--disable", "shell_snapshot", "--output-last-message", str(answer),
+            ]
+            if ai["model"]:
+                command += ["-m", ai["model"]]
+            if ai["effort"]:
+                command += ["-c", f"model_reasoning_effort={json.dumps(ai['effort'])}"]
+            command.append("-")
+            code, _, errors = run_provider(command, prompt, workspace)
+            if code or not answer.is_file():
+                detail = errors.strip()[-500:]
+                die("Codex failed; check your CLI login and account access" + (f"\n{detail}" if detail else ""))
+            return answer.read_text(encoding="utf-8")
+
+        command = [
+            executable, "--print", "--output-format", "json", "--tools", "",
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--setting-sources", "", "--no-session-persistence", "--disable-slash-commands",
+            "--permission-mode", "dontAsk",
+        ] + (["--model", ai["model"]] if ai["model"] else [])
+        code, output, errors = run_provider(command, prompt, workspace)
+        try:
+            result = json.loads(output)
+        except json.JSONDecodeError:
+            result = {}
+        if code or result.get("is_error") or "result" not in result:
+            detail = result.get("result") or errors.strip()[-500:]
+            die("Claude failed; check your CLI login and account access" + (f"\n{detail}" if detail else ""))
+        return result["result"]
+
+
+def parse_answer(text):
+    """Validate the model's JSON answer; return (files, delete, summary).
+
+    Paths must be relative, without `..` or hidden parts, so writes stay
+    inside the staging folder.
+    """
+    text = text.strip()
+    fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.S)
+    if fenced:
+        text = fenced.group(1)
+    try:
+        answer = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError("the answer was not JSON")
+        answer = json.loads(text[start:end + 1])
+    files = answer.get("files")
+    delete = answer.get("delete", [])
+    if not isinstance(files, dict) or not all(isinstance(v, str) for v in files.values()):
+        raise ValueError("'files' must map paths to file contents")
+    if not isinstance(delete, list) or not all(isinstance(p, str) for p in delete):
+        raise ValueError("'delete' must be a list of paths")
+    if len(files) > MAX_FILES:
+        raise ValueError(f"at most {MAX_FILES} files")
+    for path in [*files, *delete]:
+        parts = Path(path).parts
+        if not parts or Path(path).is_absolute() or ".." in parts or any(p.startswith(".") for p in parts):
+            raise ValueError(f"unsafe path: {path!r}")
+    for path, content in files.items():
+        if len(content.encode()) > MAX_FILE_BYTES:
+            raise ValueError(f"{path} is too large")
+    return files, delete, str(answer.get("summary", "")).strip()
+
+
+def strip_folder(files, delete, name):
+    """Drop a `<name>/` prefix the model put on every path despite the rules."""
+    prefix = f"{name}/"
+    paths = [*files, *delete]
+    if not paths or not all(path.startswith(prefix) for path in paths):
+        return files, delete
+    return ({path[len(prefix):]: content for path, content in files.items()},
+            [path[len(prefix):] for path in delete])
+
+
+def text_files(folder):
+    """Readable text files of an applet, relative path -> content."""
+    found = {}
+    for path in sorted(folder.rglob("*")):
+        rel = path.relative_to(folder)
+        if not path.is_file() or any(p.startswith(".") or p == "__pycache__" for p in rel.parts):
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if len(content) <= MAX_FILE_BYTES:
+            found[str(rel)] = content
+    return found
+
+
+def apply_files(folder, files, delete):
+    for path in delete:
+        target = folder / path
+        if target.is_file():
+            target.unlink()
+    for path, content in files.items():
+        target = folder / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        if content.startswith("#!"):
+            target.chmod(0o755)
+
+
+def static_problems(folder, name):
+    """Problems found in a staged applet without running any of its code."""
+    problems = []
+    applet, error = load(folder)
+    if error and error.startswith("missing"):
+        return [f"{error}: it must be at the top of the applet folder (paths are relative to it)"]
+    if error:
+        return [f"applet.toml: {error}"]
+    if applet["name"] != name:
+        problems.append(f"applet.toml: name must be {name!r}")
+    for rel, content in text_files(folder).items():
+        shebang = content.split("\n", 1)[0] if content.startswith("#!") else ""
+        if rel.endswith(".py") or "python" in shebang:
+            try:
+                compile(content, rel, "exec")  # parses only; nothing runs
+            except SyntaxError as error:
+                problems.append(f"{rel}:{error.lineno}: {error.msg}")
+        elif rel.endswith(".sh") or re.search(r"\b(ba)?sh\b", shebang):
+            checked = subprocess.run(["bash", "-n", str(folder / rel)], capture_output=True, text=True)
+            if checked.returncode:
+                problems.append(checked.stderr.strip().replace(str(folder) + "/", ""))
+        elif rel.endswith(".qml"):
+            if "required property var applet" not in content:
+                problems.append(f"{rel}: the root item must declare `required property var applet`")
+            if re.search(r"^import\s+Applets\b", content, re.M):
+                problems.append(f"{rel}: import the module as `import qs.Applets`")
+    return problems
+
+
+def guide():
+    """The fixed part of every prompt: rules, SPEC.md and example applets."""
+    spec = (REPO / "SPEC.md").read_text(encoding="utf-8")
+    parts = []
+    for name in ("tz", "dice", "media"):
+        for rel, content in text_files(REPO / "examples" / name).items():
+            parts.append(f'<file applet="{name}" path="{rel}">\n{content}</file>')
+    return AI_GUIDE.format(spec=spec, examples="\n".join(parts))
+
+
+def render_files(files):
+    return "\n".join(f'<file path="{rel}">\n{content}</file>' for rel, content in files.items())
+
+
+def generate(ai, prompt, staging, name):
+    """Ask, apply and statically check, sending problems back for repair."""
+    summary = ""
+    for attempt in range(AI_REPAIRS + 1):
+        status = f"Asking {describe_ai(ai)}…" if attempt == 0 else f"Fixing problems (round {attempt})…"
+        print(status, file=sys.stderr)
+        text = ask_model(ai, prompt)
+        try:
+            files, delete, summary = parse_answer(text)
+        except (ValueError, json.JSONDecodeError) as error:
+            problems = [f"invalid answer: {error}"]
+        else:
+            files, delete = strip_folder(files, delete, name)
+            apply_files(staging, files, delete)
+            problems = static_problems(staging, name)
+        if not problems:
+            return summary
+        prompt = (f"{guide()}\nYour previous answer had these problems:\n"
+                  + "\n".join(f"- {p}" for p in problems)
+                  + f"\n\nCurrent files of applet {name!r}:\n{render_files(text_files(staging))}\n\n"
+                  "Return the corrected files in the same JSON format.")
+    die("the model could not produce a valid applet:\n" + "\n".join(f"  {p}" for p in problems))
+
+
+def show_files(staging):
+    for rel, content in text_files(staging).items():
+        print(f"\n── {rel} " + "─" * max(0, 60 - len(rel)))
+        print(content.rstrip())
+    print()
+
+
+def show_diff(before, staging):
+    """Print a unified diff against `before`; return whether anything changed."""
+    after = text_files(staging)
+    changed = False
+    for rel in sorted(set(before) | set(after)):
+        old, new = before.get(rel, ""), after.get(rel, "")
+        if old == new:
+            continue
+        changed = True
+        sys.stdout.writelines(difflib.unified_diff(
+            old.splitlines(keepends=True), new.splitlines(keepends=True),
+            f"a/{rel}" if rel in before else "/dev/null", f"b/{rel}" if rel in after else "/dev/null"))
+        if new and not new.endswith("\n"):
+            print()
+    if not changed:
+        print("No changes.")
+    print()
+    return changed
+
+
+def test_run(staging, applet):
+    """Run a staged script applet once, with a throwaway data folder."""
+    data = Path(tempfile.mkdtemp(prefix=f"applet-{applet['name']}-test-"))
+    env = script_env({**applet, "dataDir": str(data)}, "refresh")
+    try:
+        result = subprocess.run([applet["entry"]], cwd=staging, env=env, timeout=applet["timeout"],
+                                capture_output=True, text=True)
+        try:
+            print(json.dumps(json.loads(result.stdout), indent=2, ensure_ascii=False))
+        except json.JSONDecodeError:
+            print(result.stdout.rstrip() or "(no output)")
+        if result.stderr.strip():
+            print(result.stderr.rstrip(), file=sys.stderr)
+        if result.returncode:
+            print(f"exited with code {result.returncode}", file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        print(f"timed out after {applet['timeout']}s", file=sys.stderr)
+    finally:
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def review(staging, assume_yes):
+    """Ask whether to install (True) or discard (False) a staged applet."""
+    if assume_yes:
+        return True
+    applet, _ = load(staging)
+    script = applet["kind"] == "script"
+    options = "[i]nstall, [t]est run, [d]iscard" if script else "[i]nstall, [d]iscard"
+    while True:
+        choice = input(f"{options}? ").strip().lower()
+        if choice in ("i", "install", "y", "yes"):
+            return True
+        if choice in ("d", "discard", "n", "no", ""):
+            return False
+        if choice in ("t", "test") and script:
+            test_run(staging, applet)
+
+
+def require_review_terminal(args):
+    # Checked before asking the model, so no request is wasted.
+    if not args.yes and not sys.stdin.isatty():
+        die("review needs a terminal; pass --yes to accept without review")
+
+
+def preferences(args):
+    """Turn `qsa new` flags into instructions for the model."""
+    wanted = []
+    if args.qml:
+        wanted.append("Make it a QML applet.")
+    if args.surface:
+        wanted.append(f'Use surface = "{args.surface}".')
+    if args.bar:
+        wanted.append("Give it a bar chip (bar = true, with an icon).")
+    if args.bar_qml:
+        wanted.append('Make it a bar-only applet with its own QML bar item (bar = "Bar.qml", no entry).')
+    return " ".join(wanted)
+
+
+# Commands ---------------------------------------------------------------------
+
+def cmd_new(args):
+    if not NAME_RE.match(args.name):
+        die("names use lowercase letters, digits and dashes")
+    if args.bar_qml and (args.qml or args.surface):
+        die("--bar-qml creates a bar-only applet; it cannot be combined with --qml or --surface")
+    if args.ai:
+        return cmd_new_ai(args)
+    folder = applets_home() / args.name
+    if folder.exists():
+        die(f"{folder} already exists")
+
+    lines = [
+        f'name = "{args.name}"',
+        f'title = "{args.name.replace("-", " ").capitalize()}"',
+    ]
+    files = {}
+    if args.bar_qml:
+        lines += ['bar = "Bar.qml"']
+        files["Bar.qml"] = BAR_QML_TEMPLATE
+    else:
+        entry = "main.qml" if args.qml else "main.sh"
+        lines += [f'entry = "{entry}"', f'surface = "{args.surface or "popup"}"']
+        if args.qml:
+            lines += ["width = 320", "height = 160"]
+            files[entry] = QML_TEMPLATE
+        else:
+            lines += ["interval = 60"]
+            files[entry] = SCRIPT_TEMPLATE
+        if args.bar:
+            lines += ["bar = true", 'icon = "●"']
+    files[MANIFEST] = "\n".join(lines) + "\n"
+
+    folder.mkdir(parents=True)
+    apply_files(folder, files, [])
+    print(f"Created {folder}")
+    if args.bar_qml:
+        print("It appears in every AppletBar; edit Bar.qml and it reloads in place.")
+    elif args.bar:
+        print(f"It appears as a chip in every AppletBar. Open it with: qsa toggle {args.name}")
+    else:
+        print(f"Open it with: qsa toggle {args.name}")
+
+
+def cmd_new_ai(args):
+    require_review_terminal(args)
+    ai = resolve_ai(args)
+    target = applets_home() / args.name
+    if target.exists():
+        die(f"{target} already exists; use `qsa edit {args.name} --ai ...` to change it")
+    prompt = (f"{guide()}\nCreate a new applet named {args.name!r} (folder and manifest name). "
+              f"{preferences(args)}\n\nThe user wants:\n{args.ai.strip()}\n")
+    with tempfile.TemporaryDirectory(prefix="applet-new-") as tmp:
+        staging = Path(tmp) / args.name
+        staging.mkdir()
+        summary = generate(ai, prompt, staging, args.name)
+        if summary:
+            print(summary)
+        show_files(staging)
+        if not review(staging, args.yes):
+            print("Discarded.")
+            return
+        applets_home().mkdir(parents=True, exist_ok=True)
+        shutil.copytree(staging, target)
+    print(f"Installed to {target}")
+
+
+def cmd_edit(args):
+    require_review_terminal(args)
+    ai = resolve_ai(args)
+    target = applets_home() / args.name
+    if not target.is_dir():
+        die(f"no applet named '{args.name}' in {applets_home()}")
+    before = text_files(target)
+    prompt = (f"{guide()}\nChange the existing applet {args.name!r}. Return only files you create "
+              "or change, with complete contents, and list removed files in \"delete\". "
+              f"Keep the name.\n\nCurrent files:\n{render_files(before)}\n\n"
+              f"The user wants:\n{args.ai.strip()}\n")
+    with tempfile.TemporaryDirectory(prefix="applet-edit-") as tmp:
+        staging = Path(tmp) / args.name
+        shutil.copytree(target, staging, symlinks=True)
+        summary = generate(ai, prompt, staging, args.name)
+        if summary:
+            print(summary)
+        if not show_diff(before, staging):
+            return
+        if not review(staging, args.yes):
+            print("Discarded; the applet is unchanged.")
+            return
+        # Swap whole folders so the shell never loads a half-written applet.
+        # The dot-prefixed old copy is ignored by scans until it is removed.
+        old = target.with_name(f".{args.name}.old-{os.getpid()}")
+        target.rename(old)
+        shutil.copytree(staging, target, symlinks=True)
+        shutil.rmtree(old)
+    print(f"Updated {target}")
+
+
+def cmd_install(args):
+    source = args.source
+    if source.startswith("gh:"):
+        source = f"https://github.com/{source[3:]}.git"
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / "applet"
+        if Path(source).is_dir():
+            shutil.copytree(source, staged, ignore=shutil.ignore_patterns(".git"))
+        else:
+            cloned = subprocess.run(["git", "clone", "--depth", "1", "--quiet", source, str(staged)])
+            if cloned.returncode:
+                die(f"could not clone {source}")
+            shutil.rmtree(staged / ".git", ignore_errors=True)
+        try:
+            name = tomllib.loads((staged / MANIFEST).read_text()).get("name", "")
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            die(f"cannot read {MANIFEST}: {error}")
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            die("the manifest needs a valid 'name'")
+        target = applets_home() / name
+        if target.exists():
+            die(f"{target} already exists; remove it first to reinstall")
+        # load() requires the folder name to match the manifest name.
+        named = Path(tmp) / name
+        staged.rename(named)
+        applet, error = load(named)
+        if error:
+            die(f"{name}: {error}")
+        surface = applet["surface"] if applet["entry"] else "bar only"
+        print(f"{name}: {applet['title']} ({applet['kind']}, {surface})")
+        if applet["description"]:
+            print(f"  {applet['description']}")
+        print("  Applets run with your user permissions. Files:")
+        for item in sorted(p for p in named.rglob("*") if p.is_file()):
+            print(f"    {item.relative_to(named)}")
+        if not args.yes and input("Install? [y/N] ").strip().lower() != "y":
+            die("cancelled")
+        applets_home().mkdir(parents=True, exist_ok=True)
+        shutil.move(str(named), target)
+    print(f"Installed to {target}")
+
+
+def cmd_remove(args):
+    home = applets_home().resolve()
+    folder = (home / args.name).resolve()
+    # Also removes invalid applets, so only require a folder directly inside.
+    if folder.parent != home or not folder.is_dir() or args.name.startswith("."):
+        die(f"no applet named '{args.name}' in {home}")
+    if not args.yes and not sys.stdin.isatty():
+        die("confirmation needs a terminal; pass --yes to remove without asking")
+    data = data_dir(folder.name)
+    targets = [folder] + ([data] if data.is_dir() and not args.keep_data else [])
+    print("Removes:")
+    for target in targets:
+        print(f"  {target}")
+    if data.is_dir() and args.keep_data:
+        print(f"Keeps its data: {data}")
+    if not args.yes and input("Remove? [y/N] ").strip().lower() != "y":
+        die("cancelled")
+    for target in targets:
+        shutil.rmtree(target)
+    print(f"Removed {folder.name}")
+
+
+def cmd_list(args):
+    applets, invalid = scan()
+    if args.json:
+        print(json.dumps({"applets": applets, "invalid": invalid}, indent=2))
+        return
+    if not applets and not invalid:
+        print(f"No applets in {applets_home()}. Create one with: qsa new <name>")
+    for applet in applets:
+        key = f"  [{applet['key']}]" if applet["key"] else ""
+        surface = applet["surface"] if applet["entry"] else "-"
+        bar = "" if applet["bar"] == "none" else "bar"
+        print(f"{applet['name']:<16} {applet['kind']:<6} {surface:<8} {bar:<4} {applet['title']}{key}")
+    for item in invalid:
+        print(f"{item['name']:<16} INVALID  {item['error']}")
+
+
+def cmd_check(args):
+    applets, invalid = scan()
+
+    def wanted(name):
+        return not args.name or name == args.name
+
+    failed = [i for i in invalid if wanted(i["name"])]
+    for item in failed:
+        print(f"✗ {item['name']}: {item['error']}")
+    for applet in applets:
+        if wanted(applet["name"]):
+            print(f"✓ {applet['name']}")
+    if args.name and not failed and not any(a["name"] == args.name for a in applets):
+        die(f"no applet named '{args.name}'")
+    sys.exit(1 if failed else 0)
+
+
+def cmd_run(args):
+    """Run a script applet once (or stream it) and pass its output through.
+
+    The output is Waybar-compatible: use `qsa run <name>` as a custom module
+    with "return-type": "json".
+    """
+    applet = find(args.name)
+    if applet["kind"] != "script":
+        die(f"{args.name} is a QML applet; only script applets can be run")
+    Path(applet["dataDir"]).mkdir(parents=True, exist_ok=True)
+    argv, event = [applet["entry"]], "refresh"
+    if args.action:
+        argv, event = [applet["entry"], "action", args.action], "action"
+    elif args.input is not None:
+        argv, event = [applet["entry"], "input", args.input], "input"
+    timeout = None if applet["stream"] and event == "refresh" else applet["timeout"]
+    try:
+        result = subprocess.run(argv, cwd=applet["dir"], env=script_env(applet, event), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        die(f"{args.name} timed out after {applet['timeout']}s")
+    sys.exit(result.returncode)
+
+
+def cmd_setup(args):
+    """Link the module into a Quickshell config, enabling `import qs.Applets`."""
+    config = Path(os.path.expanduser(args.config)).resolve()
+    if not (config / "shell.qml").is_file():
+        die(f"{config} has no shell.qml; pass your Quickshell config folder")
+    link, module = config / "Applets", RUNTIME / "Applets"
+    if link.is_symlink() and link.resolve() == module.resolve():
+        print(f"{link} already points to {module}")
+    elif link.exists() or link.is_symlink():
+        die(f"{link} already exists and is not a link to {module}")
+    else:
+        link.symlink_to(module)
+        print(f"Linked {link} -> {module}")
+    print(f"""
+Add to {config / 'shell.qml'}:
+
+    import qs.Applets
+
+    // once, inside ShellRoot
+    AppletsHost {{
+        id: applets
+        theme: Theme        // optional: your theme object, see SPEC.md
+    }}
+
+    // inside each bar, where bar applets should appear
+    AppletBar {{ host: applets }}
+
+Stop the standalone runtime if it is running: qs kill -p {RUNTIME}""")
+
+
+def cmd_daemon(args):
+    require_qs()
+    if args.replace:
+        subprocess.run(["qs", "kill", "-p", str(RUNTIME)], capture_output=True)
+        # The old instance needs a moment to exit, or -n would refuse to start.
+        for _ in range(30):
+            if not runtime_running():
+                break
+            time.sleep(0.1)
+    if hosts_applets([]):
+        die("your Quickshell config already embeds applets; the standalone runtime would show them twice")
+    env = dict(os.environ, APPLETS_HOME=str(applets_home()))
+    flags = ["-n"] + (["-d"] if args.detach else [])  # -n: refuse a second instance
+    os.execvpe("qs", ["qs", *flags, "-p", str(RUNTIME)], env)
+
+
+def cmd_window(args):
+    # `show` collides with a qs ipc subcommand, so the IPC names are open/close.
+    ipc({"show": "open", "hide": "close"}.get(args.command, args.command), args.name)
+
+
+def cmd_send(args):
+    if args.action is not None:
+        ipc("action", args.name, args.action)
+    else:
+        ipc("submit", args.name, args.input)
+
+
+def bind_key(key, flavour):
+    """Convert a manifest key such as "SUPER + CTRL + T" to compositor syntax."""
+    parts = key.replace("+", " ").split()
+    if flavour == "hyprland":
+        return " + ".join(p.upper() for p in parts)
+    names = {"SUPER": "Mod4", "CTRL": "Ctrl", "CONTROL": "Ctrl", "SHIFT": "Shift", "ALT": "Mod1"}
+    return "+".join(names.get(p.upper(), p.lower()) for p in parts)
+
+
+def cmd_binds(args):
+    cli = "qsa" if shutil.which("qsa") else str(Path(__file__).resolve())
+    for applet in scan()[0]:
+        if not applet["key"]:
+            continue
+        command = f"{cli} toggle {applet['name']}"
+        if args.sway:
+            print(f"bindsym {bind_key(applet['key'], 'sway')} exec {command}")
+        else:
+            print(f'hl.bind("{bind_key(applet["key"], "hyprland")}", hl.dsp.exec_cmd("{command}"))')
+
+
+def cmd_watch(args):
+    """Print the registry as one JSON line whenever any applet changes.
+
+    Started by AppletsHost. Polling keeps it free of extra dependencies, and
+    data folders are created here so the shell can write store.json.
+    """
+    applets_home().mkdir(parents=True, exist_ok=True)
+    previous = None
+    while True:
+        try:
+            stamp = [(p.name, revision(p)) for p in applet_folders()]
+            if stamp != previous:
+                previous = stamp
+                applets, invalid = scan()
+                revisions = dict(stamp)
+                for applet in applets:
+                    applet["revision"] = revisions.get(applet["name"], 0)
+                    Path(applet["dataDir"]).mkdir(parents=True, exist_ok=True)
+                print(json.dumps({"applets": applets, "invalid": invalid}), flush=True)
+        except OSError as error:
+            print(f"qsa watch: {error}", file=sys.stderr, flush=True)
+        time.sleep(args.poll)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="qsa", description="Applets for Quickshell: tiny desktop apps.")
+    sub = parser.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    def ai_options(p, yes_help):
+        p.add_argument("--with", dest="provider", choices=PROVIDERS,
+                       help="AI CLI to use (default: claude if installed, else codex)")
+        p.add_argument("--model", help="model to use (default: the one set in the CLI's config)")
+        p.add_argument("-y", "--yes", action="store_true", help=yes_help)
+
+    p = sub.add_parser("new", help="create an applet from a template or a description")
+    p.add_argument("name")
+    p.add_argument("--qml", action="store_true", help="QML applet instead of a script")
+    p.add_argument("--surface", choices=SURFACES, help="window type (default popup)")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--bar", action="store_true", help="also show a chip in the bar")
+    group.add_argument("--bar-qml", action="store_true", help="bar-only applet with its own QML bar item")
+    p.add_argument("--ai", metavar="DESCRIPTION", help="have Claude or Codex write it from a description")
+    ai_options(p, "with --ai: install without review")
+    p.set_defaults(func=cmd_new)
+
+    p = sub.add_parser("edit", help="change an applet with Claude or Codex")
+    p.add_argument("name")
+    p.add_argument("--ai", metavar="REQUEST", required=True, help="what to change")
+    ai_options(p, "apply without review")
+    p.set_defaults(func=cmd_edit)
+
+    p = sub.add_parser("install", help="install from a folder, git URL or gh:user/repo")
+    p.add_argument("source")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("remove", help="delete an applet and its data")
+    p.add_argument("name")
+    p.add_argument("--keep-data", action="store_true", help="keep its data folder (store, script state)")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser("list", help="list installed applets")
+    p.add_argument("--json", action="store_true", help="print the normalized manifests")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("check", help="validate manifests")
+    p.add_argument("name", nargs="?")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("run", help="run a script applet once (Waybar-compatible output)")
+    p.add_argument("name")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--action", metavar="ID")
+    group.add_argument("--input", metavar="TEXT")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("setup", help="embed applets in an existing Quickshell config")
+    p.add_argument("config", nargs="?", default="~/.config/quickshell",
+                   help="config folder (default ~/.config/quickshell)")
+    p.set_defaults(func=cmd_setup)
+
+    p = sub.add_parser("daemon", help="start the standalone runtime")
+    p.add_argument("-d", "--detach", action="store_true", help="run in the background")
+    p.add_argument("--replace", action="store_true", help="stop a running runtime first")
+    p.set_defaults(func=cmd_daemon)
+
+    for command, text in (("toggle", "show or hide"), ("show", "show"), ("hide", "hide")):
+        p = sub.add_parser(command, help=f"{text} an applet's window")
+        p.add_argument("name")
+        p.set_defaults(func=cmd_window, command=command)
+
+    p = sub.add_parser("send", help="trigger an action or submit input in a running applet")
+    p.add_argument("name")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--action", metavar="ID")
+    group.add_argument("--input", metavar="TEXT")
+    p.set_defaults(func=cmd_send)
+
+    p = sub.add_parser("binds", help="print compositor keybindings from manifests")
+    p.add_argument("--sway", action="store_true", help="sway syntax instead of Hyprland Lua")
+    p.set_defaults(func=cmd_binds)
+
+    p = sub.add_parser("path", help="print the applets folder")
+    p.set_defaults(func=lambda _: print(applets_home()))
+
+    # Internal: started by AppletsHost. Without `help` it is not listed.
+    p = sub.add_parser("watch")
+    p.add_argument("--poll", type=float, default=1.0)
+    p.set_defaults(func=cmd_watch)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        stop_child()
+        print(file=sys.stderr)
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

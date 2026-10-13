@@ -1,0 +1,4 @@
+name = "dice"
+title = "Dice"
+description = "Flip a coin or roll dice; results stay in the list."
+entry = "main.sh"
